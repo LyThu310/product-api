@@ -13,6 +13,9 @@ permissions:
   contents: read
 
 jobs:
+  # =========================================================
+  # JOB 1: CI - Integration Test
+  # =========================================================
   integration-test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -141,6 +144,8 @@ jobs:
             exit 1
           fi
 
+          grep -q '"message":"Product not found"' delete-check.json
+
       - name: Show Docker status
         if: always()
         run: docker compose ps
@@ -153,8 +158,12 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  # =========================================================
+  # JOB 2: CD - Build and Push Image to Docker Hub
+  # =========================================================
   dockerhub-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     needs: integration-test
 
@@ -181,3 +190,133 @@ jobs:
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/product-api:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/product-api:${{ github.sha }}
+
+  # =========================================================
+  # JOB 3: CD - Deploy to Local Docker Engine
+  # =========================================================
+  deploy-local:
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+
+    timeout-minutes: 10
+
+    needs:
+      - integration-test
+      - dockerhub-push
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Create production environment file
+        shell: powershell
+        run: |
+          @(
+            "PORT=3000"
+            "MONGO_URI=mongodb://nammongodb:27017/productdb"
+          ) | Set-Content -Path .env -Encoding ascii
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull latest production image
+        shell: powershell
+        run: |
+          docker compose -f docker-compose-prod.yaml pull
+
+      - name: Deploy to local Docker Engine
+        shell: powershell
+        run: |
+          docker compose -f docker-compose-prod.yaml up -d
+
+      - name: Wait for local healthchecks
+        shell: powershell
+        run: |
+          Write-Host "Waiting for local deployment..."
+
+          for ($i = 1; $i -le 30; $i++) {
+
+            $mongo = docker inspect `
+              --format='{{.State.Health.Status}}' `
+              nammongodb 2>$null
+
+            $api = docker inspect `
+              --format='{{.State.Health.Status}}' `
+              product-api-container 2>$null
+
+            if (-not $mongo) {
+              $mongo = "starting"
+            }
+
+            if (-not $api) {
+              $api = "starting"
+            }
+
+            Write-Host "MongoDB: $mongo | Product API: $api"
+
+            if (
+              $mongo -eq "healthy" -and
+              $api -eq "healthy"
+            ) {
+              Write-Host "Local deployment is healthy."
+              exit 0
+            }
+
+            Start-Sleep -Seconds 2
+          }
+
+          Write-Host "Local deployment healthcheck failed."
+
+          docker compose -f docker-compose-prod.yaml ps
+          docker compose -f docker-compose-prod.yaml logs
+
+          exit 1
+
+      - name: Verify deployed image
+        shell: powershell
+        run: |
+          $image = docker inspect product-api-container `
+            --format='{{.Config.Image}}'
+
+          Write-Host "Running image: $image"
+
+          $expectedImage = "${{ secrets.DOCKERHUB_USERNAME }}/product-api:latest"
+
+          if ($image -ne $expectedImage) {
+            Write-Host "Expected image: $expectedImage"
+            Write-Host "Actual image:   $image"
+            exit 1
+          }
+
+          Write-Host "Correct Docker Hub image is running."
+
+      - name: Test local health endpoint
+        shell: powershell
+        run: |
+          $response = Invoke-RestMethod `
+            -Uri "http://localhost:3000/health"
+
+          $response | ConvertTo-Json
+
+          if ($response.status -ne "healthy") {
+            throw "Product API is not healthy."
+          }
+
+          if ($response.mongodb -ne "connected") {
+            throw "MongoDB is not connected."
+          }
+
+          Write-Host "Local Product API healthcheck passed."
+
+      - name: Show production status
+        if: always()
+        shell: powershell
+        run: |
+          docker compose -f docker-compose-prod.yaml ps
