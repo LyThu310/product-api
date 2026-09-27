@@ -125,7 +125,7 @@ jobs:
 
           echo "$RESPONSE"
 
-        echo "$RESPONSE" | grep -q '"message":"Product deleted successfully"'
+          echo "$RESPONSE" | grep -q '"message":"Product deleted successfully"'
 
       - name: Verify Product deleted
         run: |
